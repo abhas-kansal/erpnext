@@ -1393,6 +1393,103 @@ class TestProductionPlan(FrappeTestCase):
 		for plan in plans:
 			self.assertFalse(plan in completed_plans)
 
+	def test_resered_qty_for_production_plan_offset_across_warehouses(self):
+		from erpnext.manufacturing.doctype.production_plan.production_plan import (
+			get_reserved_qty_for_production_plan,
+		)
+
+		mr_item_warehouse = "_Test Warehouse - _TC"
+		wo_source_warehouse = "_Test Warehouse 1 - _TC"
+
+		pln = create_production_plan(item_code="Test Production Item 1", planned_qty=10)
+		self.assertEqual(get_reserved_qty_for_production_plan("Raw Material Item 1", mr_item_warehouse), 10)
+
+		pln.make_work_order()
+		wo_doc = frappe.get_doc(
+			"Work Order", frappe.get_all("Work Order", filters={"production_plan": pln.name})[0].name
+		)
+		wo_doc.qty = 4
+		wo_doc.get_items_and_operations_from_bom()
+		wo_doc.source_warehouse = wo_source_warehouse
+		wo_doc.wip_warehouse = wo_source_warehouse
+		wo_doc.fg_warehouse = mr_item_warehouse
+		for d in wo_doc.required_items:
+			d.source_warehouse = wo_source_warehouse
+			make_stock_entry(
+				item_code=d.item_code,
+				qty=d.required_qty,
+				rate=100,
+				target=wo_source_warehouse,
+			)
+		wo_doc.submit()
+
+		rm_required_qty = frappe.db.get_value(
+			"Work Order Item",
+			{"parent": wo_doc.name, "item_code": "Raw Material Item 1"},
+			"required_qty",
+		)
+		self.assertEqual(
+			get_reserved_qty_for_production_plan("Raw Material Item 1", mr_item_warehouse),
+			10 - rm_required_qty,
+		)
+
+	def test_resered_qty_for_production_plan_not_offset_by_another_plan(self):
+		from erpnext.manufacturing.doctype.production_plan.production_plan import (
+			get_reserved_qty_for_production_plan,
+		)
+
+		plan_a_warehouse = "_Test Warehouse - _TC"
+		plan_b_warehouse = "_Test Warehouse 1 - _TC"
+
+		def clear_non_completed_plans_cache():
+			# get_non_completed_production_plans is request cached, so a plan submitted
+			# after an earlier read would be missing from the list
+			if hasattr(frappe.local, "request_cache"):
+				frappe.local.request_cache.clear()
+
+		def reserved_qty_on_plan_a_warehouse():
+			clear_non_completed_plans_cache()
+
+			return flt(get_reserved_qty_for_production_plan("Raw Material Item 1", plan_a_warehouse))
+
+		before_qty = reserved_qty_on_plan_a_warehouse()
+
+		# Plan A reserves the raw material on its own warehouse and has no Work Order
+		create_production_plan(item_code="Test Production Item 1", planned_qty=10)
+		self.assertEqual(reserved_qty_on_plan_a_warehouse(), before_qty + 10)
+
+		# Plan B reserves the same raw material on another warehouse and holds the only Work Order.
+		# The Work Order is partial so that Plan B stays in get_non_completed_production_plans()
+		plan_b = create_production_plan(item_code="Test Production Item 1", planned_qty=10, do_not_save=1)
+		for row in plan_b.mr_items:
+			row.warehouse = plan_b_warehouse
+		plan_b.insert()
+		plan_b.submit()
+
+		plan_b.make_work_order()
+		wo_doc = frappe.get_doc(
+			"Work Order", frappe.get_all("Work Order", filters={"production_plan": plan_b.name})[0].name
+		)
+		wo_doc.qty = 4
+		wo_doc.get_items_and_operations_from_bom()
+		wo_doc.source_warehouse = plan_b_warehouse
+		wo_doc.wip_warehouse = plan_b_warehouse
+		wo_doc.fg_warehouse = plan_b_warehouse
+		for d in wo_doc.required_items:
+			d.source_warehouse = plan_b_warehouse
+			make_stock_entry(
+				item_code=d.item_code,
+				qty=d.required_qty,
+				rate=100,
+				target=plan_b_warehouse,
+			)
+		wo_doc.submit()
+
+		clear_non_completed_plans_cache()
+		self.assertIn(plan_b.name, get_non_completed_production_plans())
+
+		self.assertEqual(reserved_qty_on_plan_a_warehouse(), before_qty + 10)
+
 	def test_resered_qty_for_production_plan_for_material_requests_with_multi_UOM(self):
 		from erpnext.stock.utils import get_or_make_bin
 

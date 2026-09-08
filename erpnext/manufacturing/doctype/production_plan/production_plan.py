@@ -1922,9 +1922,15 @@ def get_reserved_qty_for_production_plan(item_code, warehouse):
 
 	reserved_qty_for_production_plan = flt(query[0][0])
 
+	# Scope the Work Order offset to the plans reserving this item on this warehouse,
+	# so a Work Order on one plan can't net down another plan's reserve.
+	plans_reserving_item = get_production_plans_reserving_item(
+		item_code, warehouse, non_completed_production_plans
+	)
+
 	reserved_qty_for_production = flt(
 		get_reserved_qty_for_production(
-			item_code, warehouse, non_completed_production_plans, check_production_plan=True
+			item_code, warehouse, plans_reserving_item, check_production_plan=True
 		)
 	)
 
@@ -1932,6 +1938,31 @@ def get_reserved_qty_for_production_plan(item_code, warehouse):
 		return 0.0
 
 	return reserved_qty_for_production_plan - reserved_qty_for_production
+
+
+def get_production_plans_reserving_item(item_code, warehouse, non_completed_production_plans=None):
+	"""Get plans that reserve the item on the warehouse through their material request items"""
+	table = frappe.qb.DocType("Production Plan")
+	child = frappe.qb.DocType("Material Request Plan Item")
+
+	query = (
+		frappe.qb.from_(table)
+		.inner_join(child)
+		.on(table.name == child.parent)
+		.select(table.name)
+		.distinct()
+		.where(
+			(table.docstatus == 1)
+			& (child.item_code == item_code)
+			& (child.warehouse == warehouse)
+			& (table.status.notin(["Completed", "Closed"]))
+		)
+	)
+
+	if non_completed_production_plans:
+		query = query.where(table.name.isin(non_completed_production_plans))
+
+	return query.run(pluck="name")
 
 
 @frappe.request_cache

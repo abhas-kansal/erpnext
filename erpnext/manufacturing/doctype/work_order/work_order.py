@@ -1952,19 +1952,17 @@ def get_reserved_qty_for_production(
 		frappe.qb.from_(wo)
 		.from_(wo_item)
 		.select(Sum(qty_field))
-		.where(
-			(wo_item.item_code == item_code)
-			& (wo_item.parent == wo.name)
-			& (wo.docstatus == 1)
-			& (wo_item.source_warehouse == warehouse)
-		)
+		.where((wo_item.item_code == item_code) & (wo_item.parent == wo.name) & (wo.docstatus == 1))
 	)
 
 	if check_production_plan:
+		# Consumption clears a Work Order's reserve warehouse-agnostically, so
+		# mirror that here instead of matching on `warehouse`.
 		query = query.where(wo.production_plan.isnotnull())
 	else:
 		query = query.where(
-			(wo.status.notin(["Stopped", "Completed", "Closed"]))
+			(wo_item.source_warehouse == warehouse)
+			& (wo.status.notin(["Stopped", "Completed", "Closed"]))
 			& (
 				(wo_item.required_qty > wo_item.transferred_qty)
 				| (wo_item.required_qty > wo_item.consumed_qty)
