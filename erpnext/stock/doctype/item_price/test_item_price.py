@@ -38,6 +38,34 @@ class TestItemPrice(FrappeTestCase):
 
 		self.assertRaises(frappe.ValidationError, doc.save)
 
+	def test_template_item_price_allowed_with_setting(self):
+		from erpnext.stock.doctype.item.test_item import make_item
+
+		item = make_item(
+			"Test Template Item 2",
+			{
+				"has_variants": 1,
+				"variant_based_on": "Manufacturer",
+			},
+		)
+
+		frappe.db.set_single_value("Stock Settings", "allow_item_price_for_template_item", 1)
+		self.addCleanup(
+			frappe.db.set_single_value, "Stock Settings", "allow_item_price_for_template_item", 0
+		)
+
+		doc = frappe.get_doc(
+			{
+				"doctype": "Item Price",
+				"price_list": "_Test Price List",
+				"item_code": item.name,
+				"price_list_rate": 100,
+			}
+		)
+		doc.insert()
+
+		self.assertTrue(frappe.db.exists("Item Price", doc.name))
+
 	def test_duplicate_item(self):
 		doc = frappe.copy_doc(test_records[0])
 		self.assertRaises(ItemPriceDuplicateItem, doc.save)

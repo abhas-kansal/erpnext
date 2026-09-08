@@ -79,10 +79,17 @@ class ItemPrice(Document):
 			)
 
 	def validate_item_template(self):
-		if frappe.get_cached_value("Item", self.item_code, "has_variants"):
-			msg = f"Item Price cannot be created for the template item {bold(self.item_code)}"
+		if not frappe.get_cached_value("Item", self.item_code, "has_variants"):
+			return
 
-			frappe.throw(_(msg))
+		if frappe.get_cached_value(
+			"Stock Settings", "Stock Settings", "allow_item_price_for_template_item"
+		):
+			return
+
+		msg = f"Item Price cannot be created for the template item {bold(self.item_code)}"
+
+		frappe.throw(_(msg))
 
 	def check_duplicates(self):
 		item_price = frappe.qb.DocType("Item Price")

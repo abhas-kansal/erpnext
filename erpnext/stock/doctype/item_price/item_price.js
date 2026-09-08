@@ -3,12 +3,18 @@
 
 frappe.ui.form.on("Item Price", {
 	setup(frm) {
+		frappe.db
+			.get_single_value("Stock Settings", "allow_item_price_for_template_item")
+			.then((value) => {
+				frm.__allow_item_price_for_template_item = value;
+			});
+
 		frm.set_query("item_code", function () {
-			return {
-				filters: {
-					has_variants: 0,
-				},
-			};
+			let filters = {};
+			if (!frm.__allow_item_price_for_template_item) {
+				filters.has_variants = 0;
+			}
+			return { filters };
 		});
 	},
 

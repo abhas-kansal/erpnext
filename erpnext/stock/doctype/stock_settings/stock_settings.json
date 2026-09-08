@@ -19,6 +19,7 @@
   "update_price_list_based_on",
   "column_break_12",
   "update_existing_price_list_rate",
+  "allow_item_price_for_template_item",
   "conversion_factor_section",
   "allow_to_edit_stock_uom_qty_for_sales",
   "column_break_lznj",
@@ -292,6 +293,13 @@
    "fieldname": "update_existing_price_list_rate",
    "fieldtype": "Check",
    "label": "Update Existing Price List Rate"
+  },
+  {
+   "default": "0",
+   "description": "If enabled, an Item Price can be set for a template item (an item with variants). Variants without their own Item Price will use this rate.",
+   "fieldname": "allow_item_price_for_template_item",
+   "fieldtype": "Check",
+   "label": "Allow Item Price for Template Item"
   },
   {
    "fieldname": "defaults_tab",
