@@ -1350,6 +1350,60 @@ class TestProductionPlan(FrappeTestCase):
 
 			self.assertEqual(after_qty, before_qty)
 
+	def test_resered_qty_for_production_plan_for_work_order_on_another_warehouse(self):
+		# WO's source_warehouse differs from the plan's mr_items warehouse, so nothing
+		# else recalculates the plan's bin once the plan is fully ordered (#57313).
+		from erpnext.stock.utils import get_or_make_bin
+
+		mr_item_warehouse = "_Test Warehouse - _TC"
+		wo_source_warehouse = "_Test Warehouse 1 - _TC"
+
+		bin_name = get_or_make_bin("Raw Material Item 1", mr_item_warehouse)
+		before_qty = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
+
+		pln = create_production_plan(item_code="Test Production Item 1")
+
+		after_qty = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
+		self.assertEqual(after_qty - before_qty, 1)
+
+		pln.make_work_order()
+
+		for row in frappe.get_all("Work Order", filters={"production_plan": pln.name}, fields=["name"]):
+			wo_doc = frappe.get_doc("Work Order", row.name)
+			wo_doc.source_warehouse = wo_source_warehouse
+			wo_doc.wip_warehouse = wo_source_warehouse
+			wo_doc.fg_warehouse = mr_item_warehouse
+			for d in wo_doc.required_items:
+				d.source_warehouse = wo_source_warehouse
+
+			wo_doc.submit()
+
+		self.assertNotIn(pln.name, get_non_completed_production_plans())
+
+		after_qty = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
+		self.assertEqual(after_qty, before_qty)
+
+	def test_resered_qty_for_production_plan_released_when_plan_completes(self):
+		# Completed plans are left out of the reserve, so completing a plan via
+		# update_produced_pending_qty() has to recalculate its bins too (#57313).
+		from erpnext.stock.utils import get_or_make_bin
+
+		bin_name = get_or_make_bin("Raw Material Item 1", "_Test Warehouse - _TC")
+		before_qty = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
+
+		pln = create_production_plan(item_code="Test Production Item 1", planned_qty=10)
+
+		after_qty = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
+		self.assertEqual(after_qty - before_qty, 10)
+
+		plan = frappe.get_doc("Production Plan", pln.name)
+		plan.update_produced_pending_qty(10, plan.po_items[0].name)
+
+		self.assertEqual(frappe.db.get_value("Production Plan", pln.name, "status"), "Completed")
+
+		after_qty = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
+		self.assertEqual(after_qty, before_qty)
+
 	def test_resered_qty_for_production_plan_for_less_rm_qty(self):
 		from erpnext.stock.utils import get_or_make_bin
 

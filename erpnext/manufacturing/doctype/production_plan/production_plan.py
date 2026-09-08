@@ -566,8 +566,14 @@ class ProductionPlan(Document):
 				data.db_update()
 
 		self.calculate_total_produced_qty()
+
+		previous_status = self.status
 		self.set_status()
 		self.db_set("status", self.status)
+
+		# the status is the only thing a stock entry changes that the reserve reads
+		if self.docstatus == 1 and self.status != previous_status:
+			self.update_bin_qty()
 
 	def on_submit(self):
 		self.update_bin_qty()
@@ -617,6 +623,9 @@ class ProductionPlan(Document):
 		return so_wise_planned_qty
 
 	def update_bin_qty(self):
+		# what counts as an open plan may have just changed
+		clear_non_completed_production_plans_cache()
+
 		for d in self.mr_items:
 			if d.warehouse:
 				bin_name = get_or_make_bin(d.item_code, d.warehouse)
@@ -653,10 +662,11 @@ class ProductionPlan(Document):
 			self.update_requested_status()
 			self.update_ordered_status()
 
-		if close is not None:
+		if close is not None or update_bin:
+			# `update_bin_qty()` reads the status back from the database
 			self.db_set("status", self.status)
 
-		if update_bin and self.docstatus == 1 and self.status != "Completed":
+		if update_bin and self.docstatus == 1:
 			self.update_bin_qty()
 
 	def update_ordered_status(self):
@@ -1893,6 +1903,8 @@ def get_reserved_qty_for_production_plan(item_code, warehouse):
 	child = frappe.qb.DocType("Material Request Plan Item")
 
 	non_completed_production_plans = get_non_completed_production_plans()
+	if not non_completed_production_plans:
+		return None
 
 	query = (
 		frappe.qb.from_(table)
@@ -1909,13 +1921,9 @@ def get_reserved_qty_for_production_plan(item_code, warehouse):
 			& (child.item_code == item_code)
 			& (child.warehouse == warehouse)
 			& (table.status.notin(["Completed", "Closed"]))
+			& (table.name.isin(non_completed_production_plans))
 		)
-	)
-
-	if non_completed_production_plans:
-		query = query.where(table.name.isin(non_completed_production_plans))
-
-	query = query.run()
+	).run()
 
 	if not query or query[0][0] is None:
 		return None
@@ -1951,6 +1959,17 @@ def get_non_completed_production_plans():
 			& (child.planned_qty > child.ordered_qty)
 		)
 	).run(pluck="name")
+
+
+def clear_non_completed_production_plans_cache():
+	"""Drop the request-cached open-plan list so the next call reads fresh from the database."""
+	cache = getattr(frappe.local, "request_cache", None)
+	if cache is None:
+		return
+
+	# request_cache keys on the undecorated function
+	cache.pop(getattr(get_non_completed_production_plans, "__wrapped__", None), None)
+	cache.pop(get_non_completed_production_plans, None)
 
 
 def get_raw_materials_of_sub_assembly_items(

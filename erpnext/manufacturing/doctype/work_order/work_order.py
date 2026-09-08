@@ -901,8 +901,7 @@ class WorkOrder(Document):
 				)
 
 			doc = frappe.get_doc("Production Plan", self.production_plan)
-			doc.set_status()
-			doc.db_set("status", doc.status)
+			doc.set_status(update_bin=True)
 
 	def update_work_order_qty_in_so(self):
 		if (not self.sales_order and not self.sales_order_item) or self.production_plan_sub_assembly_item:
