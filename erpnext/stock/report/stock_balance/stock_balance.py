@@ -9,7 +9,7 @@ import frappe
 from frappe import _
 from frappe.query_builder import Order
 from frappe.query_builder.functions import Coalesce, Count
-from frappe.utils import add_days, cint, date_diff, flt, getdate
+from frappe.utils import add_days, cint, date_diff, flt, get_link_to_form, getdate
 from frappe.utils.nestedset import get_descendants_of
 
 import erpnext
@@ -20,6 +20,7 @@ from erpnext.stock.report.stock_ageing.stock_ageing import (
 	get_average_age,
 	normalize_fifo_queue,
 )
+from erpnext.stock.report.stock_ledger.stock_ledger import get_serial_batch_bundle_details
 from erpnext.stock.utils import add_additional_uom_columns
 
 
@@ -34,6 +35,9 @@ class StockBalanceFilter(TypedDict):
 	include_uom: str | None  # include extra info in converted UOM
 	show_stock_ageing_data: bool
 	show_variant_attributes: bool
+	show_serial_batch_wise: bool
+	batch_no: str | None
+	serial_no: str | None
 
 
 SLEntry = dict[str, Any]
@@ -63,6 +67,7 @@ class StockBalanceReport:
 
 	def run(self):
 		self.float_precision = cint(frappe.db.get_default("float_precision")) or 3
+		self.validate_serial_batch_wise_filters()
 
 		self.inventory_dimensions = self.get_inventory_dimension_fields()
 		self.prepare_opening_data_from_closing_balance()
@@ -76,8 +81,36 @@ class StockBalanceReport:
 
 		return self.columns, self.data
 
+	def validate_serial_batch_wise_filters(self) -> None:
+		if not self.filters.get("show_serial_batch_wise"):
+			return
+
+		if self.filters.get("show_stock_ageing_data"):
+			frappe.throw(
+				_("Show Serial / Batch Wise Stock cannot be used together with Show Stock Ageing Data.")
+			)
+
+		# every batch/serial in a bundle becomes its own row, so an unscoped run over a
+		# company with serialized stock would replay and explode the entire ledger
+		if not (
+			self.filters.get("item_code")
+			or self.filters.get("item_group")
+			or self.filters.get("warehouse")
+			or self.filters.get("batch_no")
+			or self.filters.get("serial_no")
+		):
+			frappe.throw(
+				_(
+					"Please select an Item, Item Group, Warehouse, Batch No or Serial No to view Serial / Batch wise stock."
+				)
+			)
+
 	def prepare_opening_data_from_closing_balance(self) -> None:
 		self.opening_data = frappe._dict({})
+
+		if self.filters.get("show_serial_batch_wise"):
+			# the closing balance snapshot has no batch/serial breakdown to open with
+			return
 
 		closing_balance = self.get_closing_balance()
 		if not closing_balance:
@@ -102,7 +135,9 @@ class StockBalanceReport:
 
 		del self.sle_entries
 
-		sre_details = self.get_sre_reserved_qty_details()
+		sre_details = (
+			{} if self.filters.get("show_serial_batch_wise") else self.get_sre_reserved_qty_details()
+		)
 
 		variant_values = {}
 		if self.filters.get("show_variant_attributes"):
@@ -128,9 +163,16 @@ class StockBalanceReport:
 
 				report_data.update(stock_ageing_data)
 
-			report_data.update(
-				{"reserved_stock": sre_details.get((report_data.item_code, report_data.warehouse), 0.0)}
-			)
+			if self.filters.get("show_serial_batch_wise"):
+				# reserved stock is per item+warehouse, repeating it per batch/serial would
+				# make the total row count it many times over
+				report_data.val_rate = (
+					report_data.bal_val / report_data.bal_qty if report_data.bal_qty else 0.0
+				)
+			else:
+				report_data.update(
+					{"reserved_stock": sre_details.get((report_data.item_code, report_data.warehouse), 0.0)}
+				)
 
 			if (
 				not self.filters.get("include_zero_stock_items")
@@ -146,15 +188,23 @@ class StockBalanceReport:
 		item_warehouse_map = {}
 		self.opening_vouchers = self.get_opening_vouchers()
 
-		if self.filters.get("show_stock_ageing_data"):
+		if self.filters.get("show_serial_batch_wise"):
+			self.validate_unbundled_reconciliations()
+
+		if self.filters.get("show_stock_ageing_data") or self.filters.get("show_serial_batch_wise"):
 			self.sle_entries = self.sle_query.run(as_dict=True)
 
 		self.prepare_stock_reco_voucher_wise_count()
 
+		if self.filters.get("show_serial_batch_wise"):
+			self.sle_entries = self.expand_serial_batch_wise_entries(self.sle_entries)
+
 		# HACK: This is required to avoid causing db query in flt
 		_system_settings = frappe.get_cached_doc("System Settings")
 		with frappe.db.unbuffered_cursor():
-			if not self.filters.get("show_stock_ageing_data"):
+			if not self.filters.get("show_stock_ageing_data") and not self.filters.get(
+				"show_serial_batch_wise"
+			):
 				self.sle_entries = self.sle_query.run(as_dict=True, as_iterator=True)
 
 			for entry in self.sle_entries:
@@ -176,6 +226,108 @@ class StockBalanceReport:
 		)
 
 		return item_warehouse_map
+
+	def expand_serial_batch_wise_entries(self, sle_entries: list[SLEntry]) -> list[SLEntry]:
+		"""Split each entry into one row per batch/serial it covers.
+
+		A bundle can carry a batch alone, a serial alone, or both together (a serialized
+		batch item); each child becomes its own row either way, with whichever of
+		batch_no/serial_no it doesn't have left blank.
+
+		A legacy (pre-bundle) entry carries at most a single batch_no directly -- already
+		attributable, no splitting needed -- or an unexpanded multi-serial text list, which
+		Stock Ledger's own segregate_serial_batch_bundle doesn't split either; it goes into
+		the shared "no serial" bucket rather than being guessed at per unit.
+		"""
+		filter_serial_no = self.filters.get("serial_no")
+		bundle_map = get_serial_batch_bundle_details(sle_entries, self.filters)
+
+		expanded: list[SLEntry] = []
+		for entry in sle_entries:
+			if entry.serial_and_batch_bundle:
+				for child in bundle_map.get(entry.serial_and_batch_bundle) or []:
+					if filter_serial_no and child.serial_no != filter_serial_no:
+						continue
+
+					row = frappe._dict(entry)
+					row.is_expanded_row = True
+					row.batch_no = child.batch_no or ""
+					row.serial_no = child.serial_no or ""
+					row.actual_qty = child.qty
+					row.stock_value_difference = child.stock_value_difference
+					expanded.append(row)
+
+			else:
+				row = entry
+				if row.serial_no:
+					if filter_serial_no:
+						continue
+					row = frappe._dict(entry)
+					row.serial_no = ""
+
+				expanded.append(row)
+
+		return expanded
+
+	def validate_unbundled_reconciliations(self) -> None:
+		"""A Stock Reconciliation with no direct batch_no and no bundle records only an
+		item+warehouse snapshot; for a tracked item that snapshot cannot be attributed to a
+		batch or serial, so the breakdown would be wrong. A direct batch_no with no bundle
+		(pre-bundle data) is already a valid per-batch delta -- prepare_item_warehouse_map's
+		own snapshot-diff condition already excludes it for the same reason.
+
+		A zero actual_qty entry is a no-op recount that matched the existing balance, so it
+		carries no delta to attribute to any batch/serial in the first place -- whatever
+		breakdown existed before it stays correct after it, unattributed or not.
+
+		Deliberately not scoped by the batch_no/serial_no filters: those exist to narrow
+		which Serial and Batch Bundle *children* end up in the report, not to decide which
+		vouchers are even visible here -- an ambiguous reconciliation for an item can affect
+		any of its batches, so it must be caught regardless of which one the user filtered to.
+		"""
+		sle = frappe.qb.DocType("Stock Ledger Entry")
+		item_table = frappe.qb.DocType("Item")
+
+		query = (
+			frappe.qb.from_(sle)
+			.inner_join(item_table)
+			.on(sle.item_code == item_table.name)
+			.select(sle.voucher_no)
+			.distinct()
+			.where(
+				(sle.docstatus < 2)
+				& (sle.is_cancelled == 0)
+				& (sle.voucher_type == "Stock Reconciliation")
+				& (sle.actual_qty != 0)
+				& (Coalesce(sle.serial_and_batch_bundle, "") == "")
+				& ((item_table.has_batch_no == 1) | (item_table.has_serial_no == 1))
+				& ((Coalesce(sle.batch_no, "") == "") | (Coalesce(sle.serial_no, "") != ""))
+			)
+		)
+		query = self.apply_inventory_dimensions_filters(query, sle)
+		query = self.apply_warehouse_filters(query, sle)
+		query = self.apply_items_filters(query, item_table)
+		query = self.apply_date_filters(query, sle)
+
+		if self.filters.get("company"):
+			query = query.where(sle.company == self.filters.get("company"))
+
+		vouchers = sorted({row.voucher_no for row in query.run(as_dict=True)})
+		if not vouchers:
+			return
+
+		links = ", ".join(get_link_to_form("Stock Reconciliation", voucher) for voucher in vouchers[:5])
+		if len(vouchers) > 5:
+			links += _(" and {0} more").format(len(vouchers) - 5)
+
+		frappe.throw(
+			_(
+				"Serial / Batch wise stock cannot be calculated for this period. The following Stock Reconciliation entries do not record which Batch or Serial Nos they replaced, so the balance of each Batch / Serial No would be wrong: {0}"
+			).format(links)
+			+ "<br><br>"
+			+ _("Change the date range to exclude these entries."),
+			title=_("Serial / Batch wise stock unavailable"),
+		)
 
 	def prepare_stock_reco_voucher_wise_count(self):
 		self.stock_reco_voucher_wise_count = frappe._dict()
@@ -259,8 +411,11 @@ class StockBalanceReport:
 		for field in self.inventory_dimensions:
 			qty_dict[field] = entry.get(field)
 
-		if entry.voucher_type == "Stock Reconciliation" and (
-			not entry.batch_no or entry.serial_no or entry.serial_and_batch_bundle
+		# expanded rows are already per batch/serial deltas, snapshot diffing would double count
+		if (
+			not entry.get("is_expanded_row")
+			and entry.voucher_type == "Stock Reconciliation"
+			and (not entry.batch_no or entry.serial_no or entry.serial_and_batch_bundle)
 		):
 			if entry.serial_no and entry.voucher_detail_no in self.stock_reco_voucher_wise_count:
 				qty_dict.opening_qty -= self.stock_reco_voucher_wise_count.get(entry.voucher_detail_no, 0)
@@ -320,6 +475,10 @@ class StockBalanceReport:
 			}
 		)
 
+		if self.filters.get("show_serial_batch_wise"):
+			item_warehouse_map[group_by_key].batch_no = entry.get("batch_no") or ""
+			item_warehouse_map[group_by_key].serial_no = entry.get("serial_no") or ""
+
 	def get_group_by_key(self, row) -> tuple:
 		group_by_key = [row.company, row.item_code, row.warehouse]
 
@@ -329,6 +488,10 @@ class StockBalanceReport:
 
 			if self.filters.get(fieldname) or self.filters.get("show_dimension_wise_stock"):
 				group_by_key.append(row.get(fieldname))
+
+		if self.filters.get("show_serial_batch_wise"):
+			group_by_key.append(row.get("batch_no") or "")
+			group_by_key.append(row.get("serial_no") or "")
 
 		return tuple(group_by_key)
 
@@ -404,7 +567,28 @@ class StockBalanceReport:
 		if self.filters.get("company"):
 			query = query.where(sle.company == self.filters.get("company"))
 
+		query = self.apply_serial_batch_wise_filters(query, sle)
+
 		self.sle_query = query
+
+	def apply_serial_batch_wise_filters(self, query, sle):
+		if not self.filters.get("show_serial_batch_wise"):
+			return query
+
+		sbe = frappe.qb.DocType("Serial and Batch Entry")
+
+		if batch_no := self.filters.get("batch_no"):
+			bundles = frappe.qb.from_(sbe).select(sbe.parent).where(sbe.batch_no == batch_no)
+			query = query.where((sle.batch_no == batch_no) | (sle.serial_and_batch_bundle.isin(bundles)))
+
+		if serial_no := self.filters.get("serial_no"):
+			bundles = frappe.qb.from_(sbe).select(sbe.parent).where(sbe.serial_no == serial_no)
+			# legacy entries join serials with newlines, so this can only narrow the scan
+			query = query.where(
+				(sle.serial_no.like(f"%{serial_no}%")) | (sle.serial_and_batch_bundle.isin(bundles))
+			)
+
+		return query
 
 	def apply_inventory_dimensions_filters(self, query, sle) -> str:
 		inventory_dimension_fields = self.get_inventory_dimension_fields()
@@ -478,6 +662,26 @@ class StockBalanceReport:
 				"width": 100,
 			},
 		]
+
+		if self.filters.get("show_serial_batch_wise"):
+			columns.append(
+				{
+					"label": _("Batch No"),
+					"fieldname": "batch_no",
+					"fieldtype": "Link",
+					"options": "Batch",
+					"width": 100,
+				}
+			)
+			columns.append(
+				{
+					"label": _("Serial No"),
+					"fieldname": "serial_no",
+					"fieldtype": "Link",
+					"options": "Serial No",
+					"width": 100,
+				}
+			)
 
 		if self.filters.get("show_dimension_wise_stock"):
 			for dimension in get_inventory_dimensions():
@@ -583,6 +787,9 @@ class StockBalanceReport:
 				{"label": att_name, "fieldname": att_name, "width": 100}
 				for att_name in get_variants_attributes()
 			]
+
+		if self.filters.get("show_serial_batch_wise"):
+			columns = [column for column in columns if column.get("fieldname") != "reserved_stock"]
 
 		return columns
 
@@ -720,6 +927,8 @@ def filter_items_with_no_transactions(
 				"stock_uom",
 				"company",
 				"opening_fifo_queue",
+				"batch_no",
+				"serial_no",
 			]:
 				continue
 

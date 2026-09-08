@@ -138,6 +138,48 @@ frappe.query_reports["Stock Balance"] = {
 			fieldtype: "Check",
 			default: 0,
 		},
+		{
+			fieldname: "show_serial_batch_wise",
+			label: __("Show Serial / Batch Wise Stock"),
+			fieldtype: "Check",
+			default: 0,
+			on_change: function (query_report) {
+				let filters = query_report.get_values();
+				let is_scoped =
+					filters.item_code?.length ||
+					filters.item_group ||
+					filters.warehouse?.length ||
+					filters.batch_no ||
+					filters.serial_no;
+
+				if (filters.show_serial_batch_wise && !is_scoped) {
+					// defining on_change replaces the report's default refresh-on-change, so an
+					// unscoped toggle must be reported here rather than left to error out on run
+					frappe.msgprint(
+						__(
+							"Select an Item, Item Group, Warehouse, Batch No or Serial No to view Serial / Batch wise stock."
+						)
+					);
+					return;
+				}
+
+				query_report.refresh(true);
+			},
+		},
+		{
+			fieldname: "batch_no",
+			label: __("Batch No"),
+			fieldtype: "Link",
+			options: "Batch",
+			depends_on: "eval:doc.show_serial_batch_wise",
+		},
+		{
+			fieldname: "serial_no",
+			label: __("Serial No"),
+			fieldtype: "Link",
+			options: "Serial No",
+			depends_on: "eval:doc.show_serial_batch_wise",
+		},
 	],
 
 	formatter: function (value, row, column, data, default_formatter) {
